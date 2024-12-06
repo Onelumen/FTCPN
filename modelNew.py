@@ -45,26 +45,7 @@ class FTCPN(nn.Module):
                                   bias=False)
 
         # 频域重建模块 TransformerEncoderLayer
-        self.freModule=(nn.ModuleList[nn.MultiheadAttention(embed_dim=n_embding,num_heads=en_layers),
-                                        ])
-
-        # 这块得再结合论文的公式自己手推一下？不然张量维度不明白
-        # self.decoders = nn.ModuleList([nn.LSTM(input_size=n_embding,
-        #                                        hidden_size=n_embding,
-        #                                        num_layers=de_layers,
-        #                                        bidirectional=False,
-        #                                        batch_first=True,
-        #                                        dropout=de_dropout,
-        #                                        bias=False) for _ in range(1 + maxlevel)])
-        # self.LNs = nn.ModuleList([nn.LayerNorm(n_embding) for _ in range(1 + maxlevel)])
-        # if out_split:
-        #     assert n_embding % n_oup == 0
-        #     self.out_split = out_split
-        #     self.oup_embdings = nn.ModuleList(
-        #         [nn.Linear(n_embding // n_oup, 1, bias=bias) for _ in range(n_oup * 2 ** maxlevel)])
-        # else:
-        #     self.oup_embdings = nn.ModuleList(
-        #         [Embed(n_embding, n_oup, bias=True, proj=proj) for _ in range(1 + maxlevel)])
+        self.freModule = nn.ModuleList([nn.MultiheadAttention(embed_dim=n_embding, num_heads=en_layers)])
 
     def forward(self, inp):
         """
@@ -75,18 +56,17 @@ class FTCPN(nn.Module):
         """
         # 输入embdings B*T*6 -> B*T*128
         embdings = self.inp_embding(inp)  # batch * n_sequence * n_embding
+
         # 输入encoder层，得到
-        #如果输入序列的形状是 (seq_len, batch_size, input_size) 那么 en_oup 的形状将是 (seq_len, batch_size, hidden_size)，其中 hidden_size 是 LSTM 隐藏状态的维度。
-        en_oup, _ = self.encoder(embdings)
+        en_oup, _ = self.encoder(embdings)  # B * T * D
 
-        #将数据传入轨迹重建模块
-        P_1 = self.trajModule(en_oup)
+        # 将数据传入轨迹重建模块
+        P_1, _ = self.trajModule(en_oup)  # B * T * D
 
-        #将数据传入频域重建模块
+        # 将数据传入频域重建模块
+        F_2, _ = self.freModule[0](en_oup, en_oup, en_oup)
 
-        F_2 = self.freModule(en_oup)
-
-        return P_1,F_2
+        return P_1, F_2
 
 
 # 这里三个复用即可

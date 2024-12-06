@@ -49,12 +49,27 @@ class Train:
                 de_dropout=opt.dpot,
                 bias=True
             )
+        else:
+            self.net = FTCPN(
+                n_inp=6,
+                n_oup=6,
+                his_step=opt.minibatch_len - 1,
+                n_embding=opt.embding,
+                en_layers=opt.enlayer,
+                de_layers=opt.delayer,
+                activation='relu',
+                proj='linear',
+                maxlevel=opt.maxlevel,
+                en_dropout=opt.dpot,
+                de_dropout=opt.dpot,
+                bias=True
+            )
 
         # 3. 设置损失函数
         self.MSE = torch.nn.MSELoss(reduction='mean') #意为求平均的MSE
         self.MAE = torch.nn.L1Loss(reduction='mean') #意为求平均的MAE
 
-        # 4. 设置优化器，这里的net是上面定义好的net是FTCPN
+        # 4. 设置优化器，这里的net是上面定义好的net是FTCPN的实例
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=self.opt.lr)
         self.opt_lr_scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=10, gamma=0.5)
 
@@ -81,8 +96,8 @@ class Train:
     def train(self):
         #选择显卡
         self.net.to(self.device)
-
         self.net.args['train_opt'] = self.opt
+
         if not self.opt.nologging:
             log_str = f'TRAIN DETAILS'.center(50, '-') + \
                       f'\ntraining on device {self.device}...\n'
@@ -134,10 +149,10 @@ class Train:
         fre_loss_set = []
 
         for i, batch in enumerate(train_data):
-            P = train_data['original']
-            F_3 = fft(P)
+            P = batch['original']
+            F_3 = fft(P.cpu().numpy())
             # 准备数据，放到gpu里面
-            batch = torch.FloatTensor(batch).to(self.device)
+            batch = {k: torch.FloatTensor(v).to(self.device) for k, v in batch.items()}
 
             inp_batch = batch['interpolated'][:, :-1, :]  # shape: batch * n_sequence * n_attr
 
@@ -145,8 +160,7 @@ class Train:
             tgt_batch = batch  # use the all to calculate wavelet coefficients, shape: batch * n_sequence * n_attr
 
             # contiguous保证张量放到内存中是连续的
-            wt_tgt_batch = dwt(
-                batch.transpose(1, 2).contiguous())  # tuple(lo, hi), shape: batch * n_attr * n_sequence
+            wt_tgt_batch = dwt(batch['original'].transpose(1, 2).contiguous())  # tuple(lo, hi), shape: batch * n_attr * n_sequence
 
             # 在这里处理数据
             # 把不含标签的数据送入net，得到的是频域特征，但是输入的是直接的变量
@@ -154,9 +168,14 @@ class Train:
                 P_1, F_2 = self.net(inp_batch) # net是已经定义好的网络
                 # 这个注意力分数最后怎么用呢？
             else:
-                wt_pre_batch = self.net(inp_batch)
+                P_1 = self.net(inp_batch)
+                F_2 = torch.zeros_like(P_1[0])  # 如果没有启用注意力机制，则返回一个与 P_1[0] 相同形状的张量
+                # wt_pre_batch = self.net(inp_batch)
+            
+
             train_td_loss = self.cal_spatial_loss(P,P_1)
             train_fre_loss = self.cal_freq_loss(F_2,F_3)
+
             #transpose形状对齐问题没处理
             #反向传播 td和fre loss
             loss_backward = torch.tensor(self.opt.w_spatial, dtype=torch.float,
@@ -179,6 +198,7 @@ class Train:
             record_freq = 20
             if not self.opt.nologging and (i % ((batchs_len - 1) // record_freq) == 0 or i == batchs_len - 1):
                 logging.debug(f'{i}/{batchs_len - 1} ' + print_str)
+        # 打印训练结果
         print_str = f'ave_train_loss: {np.mean(train_loss_set):.8f}, ave_temporal_loss: {np.mean(td_loss_set):.8f}' \
                     + f', ave_freq_loss: {np.mean(fre_loss_set):.8f}'
         print(print_str)
@@ -239,12 +259,17 @@ class Train:
     def cal_spatial_loss(self, tgt, pre, is_training=True):
         """
         :param tgt: shape: batch * n_sequence * n_attr
-        :param pre: shape: batch * n_sequence+? * n_attr
+        :param pre: shape: batch * n_sequence * n_attr
         :return:
         """
-        n_sequence = tgt.shape[1]
+        # Ensure pre is on the same device as tgt
+        if isinstance(pre, tuple):
+            # If pre is a tuple, move each tensor inside pre to the same device as tgt
+            pre = tuple(p.to(tgt.device) for p in pre)
+        else:
+            pre = pre.to(tgt.device)  # If pre is not a tuple, move it directly to the device
 
-        # 针对训练/预测 来设置权重矩阵
+        n_sequence = tgt.shape[1]
         last_node_weight = 1.0
         if is_training:
             weights = torch.ones(n_sequence, dtype=torch.float, device=tgt.device)
@@ -253,9 +278,33 @@ class Train:
         weights[-1] = last_node_weight
         weighted_loss = torch.tensor(0.0).to(self.device)
 
-        # 计算（理解：在时间尺度上我们只关心最后一个时间步的MSE即可
+        # Ensure `pre` is a tensor
+        if isinstance(pre, tuple):
+            pre = torch.stack(pre, dim=1)
+
+        # Check if pre is sparse and convert to dense if necessary
+        if isinstance(pre, torch.sparse.Tensor):
+            pre = pre.to_dense()
+
+        # Ensure `pre` and `tgt` have the same shape
+        if pre.shape[1] != tgt.shape[1]:
+            if pre.dim() == 4:
+                # If pre has 4 dimensions, permute and adjust shape accordingly
+                pre = pre.permute(0, 2, 1, 3)  # (batch, n_sequence, n_attr, additional_dim)
+                pre = pre.contiguous().view(pre.shape[0], pre.shape[1], -1)  # Flatten last two dims
+            pre = pre.permute(0, 2, 1)  # Change shape to (batch, n_attr, n_sequence)
+            pre = torch.nn.functional.interpolate(pre, size=tgt.shape[1], mode='linear', align_corners=False)
+            pre = pre.permute(0, 2, 1)  # Change back to (batch, n_sequence, n_attr)
+
+        # Adjust pre to have the same number of attributes as tgt if necessary
+        if pre.shape[2] != tgt.shape[2]:
+            pre = pre[:, :, :tgt.shape[2]]  # Truncate or pad to match tgt.shape[2] (n_attr)
+
+        # Calculate weighted loss
         for i in range(n_sequence):
             weighted_loss += weights[i] * self.MSE(pre[:, i, :], tgt[:, i, :])
+
+        # Handling division by zero
         try:
             weighted_loss /= weights.count_nonzero()
         except:
@@ -264,19 +313,17 @@ class Train:
             else:
                 weighted_loss /= torch.tensor(1.0, dtype=torch.float).to(self.device)
 
-        # 还原无尺度：即原始数据
+        # Calculate unscaled losses (RMSE and MAE)
         loss_unscaled = {'rmse': {}, 'mae': {}}
-        # clone出数据，避免反向传播训练影响
         tgt_cloned = tgt.detach()
         pre_cloned = pre.detach()
-
-        for i, name in enumerate(self.data_set.attr_names): # 针对每一个属性在尺度上的数据
+        for i, name in enumerate(self.data_set.attr_names):
             loss_unscaled['rmse'][name] = math.sqrt(
-                # 注意：此处unscale还原尺度了
                 float(self.MSE(self.data_set.unscale(tgt_cloned[:, n_sequence - 1, i], name),
                                self.data_set.unscale(pre_cloned[:, n_sequence - 1, i], name))))
             loss_unscaled['mae'][name] = float(self.MAE(self.data_set.unscale(tgt_cloned[:, n_sequence - 1, i], name),
                                                         self.data_set.unscale(pre_cloned[:, n_sequence - 1, i], name)))
+
         return weighted_loss, loss_unscaled
 
     def cal_freq_loss(self, tgt, pre) -> torch.Tensor:
@@ -285,15 +332,11 @@ class Train:
         :param pre: list:[hi's lo] shape: batch * n_attr * n_sequence
         :return:
         """
-        wt_loss = torch.tensor(0.0).to(self.device) # 先创建在gpu上面的损失分量
-        # opt.w_lo默认为1.0,w_hi也默认为1,这两个是权重乘在结果前面，maxlevel是指定的
+        wt_loss = torch.tensor(0.0).to(self.device)
         wt_loss += self.opt.w_lo * self.MSE(tgt[0], pre[-1].transpose(1, 2))
-        for i in range(self.opt.maxlevel): # 在不同层级的小波分量上分别计算并且求和
+        for i in range(self.opt.maxlevel):
             wt_loss += self.opt.w_hi * self.MSE(pre[i].transpose(1, 2), tgt[1][i])
-            #pre[i]是第i层
-        # 分层权重求
         return wt_loss
-
 
     # 保存模型的函数
     def saving_model(self, model_path, this_model_name):

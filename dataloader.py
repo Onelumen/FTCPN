@@ -105,6 +105,8 @@ class DataGenerator:
         # return np.array(oup)
         batch_data = np.array(oup)
 
+        #   2. 掩蔽数据
+
         def mask_data(data):
             mask = np.ones_like(data) # 遮蔽矩阵
             indexlist=[]
